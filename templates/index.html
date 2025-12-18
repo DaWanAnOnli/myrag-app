@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Indonesian Legal QA - Amendment-aware RAG</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1>🇮🇩 Indonesian Legal Question Answering</h1>
+                <p class="subtitle">Amendment-aware Agentic RAG with Naive-RAG & KG-RAG Pipelines</p>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Query Input Section -->
+            <section class="query-section">
+                <div class="query-card">
+                    <h2>Ask a Legal Question</h2>
+                    <textarea 
+                        id="question-input" 
+                        placeholder="Enter your legal question in Indonesian or English..."
+                        rows="4"
+                    ></textarea>
+                    
+                    <div class="options-row">
+                        <div class="mode-selector">
+                            <label>Amendment Processing Mode:</label>
+                            <div class="radio-group">
+                                <label class="radio-option">
+                                    <input type="radio" name="mode" value="before_aggregation" checked>
+                                    <span class="radio-label">Before Aggregation</span>
+                                    <span class="radio-desc">Apply amendments to each pipeline's answer before combining</span>
+                                </label>
+                                <label class="radio-option">
+                                    <input type="radio" name="mode" value="after_aggregation">
+                                    <span class="radio-label">After Aggregation</span>
+                                    <span class="radio-desc">Apply amendments to the final aggregated answer</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <button id="submit-btn" class="submit-btn">
+                        <span class="btn-text">Submit Question</span>
+                        <span class="btn-loading hidden">
+                            <span class="spinner"></span>
+                            Processing...
+                        </span>
+                    </button>
+                </div>
+            </section>
+
+            <!-- Status Banner -->
+            <div id="status-banner" class="status-banner hidden">
+                <span class="status-icon">⏳</span>
+                <span class="status-text">Initializing...</span>
+            </div>
+
+            <!-- Results Section -->
+            <section id="results-section" class="results-section hidden">
+                <!-- Pipeline Tabs -->
+                <div class="pipeline-tabs">
+                    <button class="tab-btn active" data-tab="graphrag">
+                        <span class="tab-icon">🔗</span>
+                        KG-RAG
+                        <span class="iteration-badge" id="graphrag-iter-badge">0</span>
+                    </button>
+                    <button class="tab-btn" data-tab="naiverag">
+                        <span class="tab-icon">📄</span>
+                        Naive-RAG
+                        <span class="iteration-badge" id="naiverag-iter-badge">0</span>
+                    </button>
+                    <button class="tab-btn" data-tab="amendment">
+                        <span class="tab-icon">📜</span>
+                        Amendment Processing
+                    </button>
+                    <button class="tab-btn" data-tab="aggregator">
+                        <span class="tab-icon">⚖️</span>
+                        Aggregator
+                    </button>
+                    <button class="tab-btn" data-tab="final">
+                        <span class="tab-icon">✅</span>
+                        Final Answer
+                    </button>
+                </div>
+
+                <!-- Tab Content -->
+                <div class="tab-content">
+                    <!-- GraphRAG Tab -->
+                    <div id="graphrag-tab" class="tab-panel active">
+                        <div class="panel-header">
+                            <h3>KG-RAG Pipeline (Knowledge Graph)</h3>
+                            <p class="panel-desc">Uses entity/triple extraction, graph traversal, and semantic retrieval</p>
+                        </div>
+                        <div id="graphrag-iterations" class="iterations-container">
+                            <div class="empty-state">Waiting for processing...</div>
+                        </div>
+                    </div>
+
+                    <!-- NaiveRAG Tab -->
+                    <div id="naiverag-tab" class="tab-panel hidden">
+                        <div class="panel-header">
+                            <h3>Naive-RAG Pipeline (Vector Search)</h3>
+                            <p class="panel-desc">Uses direct vector similarity search on document chunks</p>
+                        </div>
+                        <div id="naiverag-iterations" class="iterations-container">
+                            <div class="empty-state">Waiting for processing...</div>
+                        </div>
+                    </div>
+
+                    <!-- Amendment Tab -->
+                    <div id="amendment-tab" class="tab-panel hidden">
+                        <div class="panel-header">
+                            <h3>Amendment-aware Processing</h3>
+                            <p class="panel-desc" id="amendment-mode-desc">Processing mode will be shown here</p>
+                        </div>
+                        <div id="amendment-content" class="amendment-container">
+                            <div class="empty-state">Waiting for amendment processing...</div>
+                        </div>
+                    </div>
+
+                    <!-- Aggregator Tab -->
+                    <div id="aggregator-tab" class="tab-panel hidden">
+                        <div class="panel-header">
+                            <h3>Aggregator Decision</h3>
+                            <p class="panel-desc">Combines or selects the best answer from both pipelines</p>
+                        </div>
+                        <div id="aggregator-content" class="aggregator-container">
+                            <div class="empty-state">Waiting for aggregation...</div>
+                        </div>
+                    </div>
+
+                    <!-- Final Answer Tab -->
+                    <div id="final-tab" class="tab-panel hidden">
+                        <div class="panel-header">
+                            <h3>Final Answer</h3>
+                            <p class="panel-desc">The complete, amendment-aware response to your question</p>
+                        </div>
+                        <div id="final-answer-content" class="final-answer-container">
+                            <div class="empty-state">Processing your question...</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Amendment-aware Agentic Legal QA System for Indonesian Law</p>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
