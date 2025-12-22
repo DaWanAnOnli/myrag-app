@@ -1,36 +1,21 @@
 #!/usr/bin/env python3
 """
-multi-agent.py (amendment-aware, pre-aggregation)
-A combined multi-agent RAG orchestrator that:
-- Runs two internal pipelines (self-contained in this file):
-  1) GraphRAG with Answer Judge + Query Modifier loop
-  2) NaiveRAG with Answer Judge + Query Modifier loop
-- Adds amendment-aware verification BEFORE aggregation (per pipeline), using:
-  * UU reference extraction (LLM)
-  * Amendment chain traversal with repeal-reset logic
-  * Two-stage retrieval of amending documents (filter first by UU, then cosine rerank)
-  * Relevance judge + amendment integration into the pipeline answer
-- Aggregator Agent: chooses the best answer or synthesizes a combined answer.
-- Comprehensive logging; per-iteration tagging; QPS controls; retries.
+multi-agent.py (amendment-aware, pre-aggregation) — MODIFIED to re-use stored chunk embeddings in Neo4j.
 
-Neo4j expectations:
+Key changes vs original:
+- GraphRAG Step 5 chunk rerank no longer embeds chunk text each run.
+- GraphRAG chunk collection no longer relies on LangChain pickle ChunkStore by default.
+  It fetches TextChunk.content + TextChunk.embedding from Neo4j using (document_id, chunk_id) with fallbacks.
+- NaiveRAG already used Neo4j vector index on TextChunk.embedding; left as-is (it was already efficient for chunks).
+
+Still embeds (per run):
+- The user query (needed for vector search / similarity).
+- Query triples + entities (needed for triple/entity retrieval).
+
+Neo4j expectations (unchanged):
 - (:Triple {embedding}) vector index: 'triple_vec'
 - Optional entity vector indexes: 'document_vec', 'content_vec', 'expression_vec'
 - (:TextChunk {embedding, uu_number, content, document_id, chunk_id, pages}) vector index: 'chunk_embedding_index'
-- Amendment graph: (:AMD_UndangUndang {key: 'AMD_X_Y', number: X, year: Y}) with relationships:
-  'AMD_DIUBAH_DENGAN', 'AMD_DIUBAH_SEBAGIAN_DENGAN', 'AMD_DICABUT_DENGAN', 'AMD_DICABUT_SEBAGIAN_DENGAN'
-
-Important note on uu_number:
-- The TextChunk.uu_number field is stored ONLY in these exact formats:
-  "Undang-undang (UU) Nomor X Tahun Y"
-  "Undang-undang (UU) No. X Tahun Y"
-- All filters must be converted to these exact strings before querying.
-
-Environment (.env):
-- GOOGLE_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASS
-- GEN_MODEL (default: models/gemini-2.5-flash)
-- EMBED_MODEL (default: models/text-embedding-004)
-- Optional tuning overrides for QPS, concurrency, iteration caps, etc.
 """
 
 import os, time, json, math, pickle, re, random, hashlib, threading, sys
@@ -70,12 +55,12 @@ NEO4J_MAX_CONCURRENCY = int(os.getenv("NEO4J_MAX_CONCURRENCY", "0"))  # 0=unlimi
 GEN_MODEL   = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
 
-# Dataset folder for original chunk pickles (GraphRAG ChunkStore)
+# Dataset folder for original chunk pickles (GraphRAG ChunkStore) — now optional for fallback only
 DEFAULT_LANGCHAIN_DIR = (_here / "../../../dataset/3_indexing/3a_langchain_results/").resolve()
 LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
 SKIP_FILES = {"all_langchain_documents.pkl"}
 
-# ----------------- GraphRAG parameters -----------------
+# GraphRAG parameters
 ENTITY_MATCH_TOP_K = int(os.getenv("ENTITY_MATCH_TOP_K", "15"))
 ENTITY_SUBGRAPH_HOPS = int(os.getenv("ENTITY_SUBGRAPH_HOPS", "5"))
 ENTITY_SUBGRAPH_PER_HOP_LIMIT = int(os.getenv("ENTITY_SUBGRAPH_PER_HOP_LIMIT", "2000"))
@@ -88,12 +73,12 @@ ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
 MAX_ANSWER_JUDGE_ITERS = int(os.getenv("MAX_ANSWER_JUDGE_ITERS", "5"))
 AJ_ANSWER_MAX_CHARS = int(os.getenv("AJ_ANSWER_MAX_CHARS", "400000000"))
 
-# ----------------- NaiveRAG parameters -----------------
+# NaiveRAG parameters
 TOP_K_CHUNKS = int(os.getenv("TOP_K_CHUNKS", "40"))
 NAIVE_MAX_CHUNKS_FINAL = int(os.getenv("NAIVE_MAX_CHUNKS_FINAL", str(MAX_CHUNKS_FINAL)))
 CHUNK_TEXT_CLAMP = int(os.getenv("CHUNK_TEXT_CLAMP", "200000"))
 
-# ----------------- Global LLM throttling (concurrency + QPS) -----------------
+# Global LLM throttling (concurrency + QPS)
 LLM_EMBED_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_EMBED_MAX_CONCURRENCY", "165")))
 LLM_EMBED_QPS = float(os.getenv("LLM_EMBED_QPS", "165.0"))
 LLM_GEN_MAX_CONCURRENCY   = max(1, int(os.getenv("LLM_GEN_MAX_CONCURRENCY", "100")))
@@ -245,7 +230,7 @@ _EMBED_QPS = QpsLimiter(LLM_EMBED_QPS)
 _GEN_QPS   = QpsLimiter(LLM_GEN_QPS)
 _NEO4J_SEM = Semaphore(NEO4J_MAX_CONCURRENCY) if NEO4J_MAX_CONCURRENCY > 0 else None
 
-# Embedding cache
+# Embedding cache (for texts we still embed: query, query triples, entities)
 _EMB_CACHE: Dict[str, List[float]] = {}
 _EMB_CACHE_LOCK = Lock()
 
@@ -322,6 +307,7 @@ def _api_call_with_retry(func, *args, **kwargs):
             time.sleep(wait_s)
 
 def embed_text(text: str) -> List[float]:
+    """Used only for query / query-triple / entity embeddings (not chunk text reranking)."""
     key = _cache_key_for_text(text)
     with _EMB_CACHE_LOCK:
         if key in _EMB_CACHE:
@@ -460,13 +446,62 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
 
 def cos_sim(a: List[float], b: List[float]) -> float:
     a = _as_float_list(a); b = _as_float_list(b)
-    dot = sum(x*y for x,y in zip(a,b))
+    dot = sum(x*y for x, y in zip(a, b))
     na = math.sqrt(sum(x*x for x in a)); nb = math.sqrt(sum(y*y for y in b))
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
 
-# ----------------- ChunkStore (GraphRAG, optional) -----------------
+# ----------------- TextChunk fetch (NEW): retrieve stored chunk embeddings/content from Neo4j -----------------
+def fetch_textchunk_by_doc_chunk(document_id: Any, chunk_id: Any) -> Optional[Dict[str, Any]]:
+    """
+    Fetch TextChunk node by (document_id, chunk_id) with fallbacks:
+    1) exact (document_id, chunk_id)
+    2) base chunk_id if chunk_id contains '::...'
+    3) chunk_id only (doc mismatch rescue)
+    Returns dict: {content, embedding, key, document_id?, match}
+    """
+    doc = _norm_id(document_id)
+    ch = _norm_id(chunk_id)
+    if not doc or not ch:
+        return None
+
+    cypher1 = """
+    MATCH (c:TextChunk {document_id:$doc, chunk_id:$chunk})
+    RETURN c.content AS content, c.embedding AS embedding, c.key AS key
+    LIMIT 1
+    """
+    res = run_cypher_with_retry(cypher1, {"doc": doc, "chunk": ch})
+    if res:
+        r = res[0]
+        return {"content": r["content"], "embedding": r["embedding"], "key": r["key"], "match": "exact"}
+
+    if "::" in ch:
+        base = ch.split("::", 1)[0]
+        res = run_cypher_with_retry(cypher1, {"doc": doc, "chunk": base})
+        if res:
+            r = res[0]
+            return {"content": r["content"], "embedding": r["embedding"], "key": r["key"], "match": "base_id"}
+
+    cypher3 = """
+    MATCH (c:TextChunk {chunk_id:$chunk})
+    RETURN c.content AS content, c.embedding AS embedding, c.key AS key, c.document_id AS document_id
+    LIMIT 1
+    """
+    res = run_cypher_with_retry(cypher3, {"chunk": ch})
+    if res:
+        r = res[0]
+        return {
+            "content": r["content"],
+            "embedding": r["embedding"],
+            "key": r["key"],
+            "document_id": r["document_id"],
+            "match": "chunk_id_only"
+        }
+
+    return None
+
+# ----------------- ChunkStore (GraphRAG, now optional fallback) -----------------
 class ChunkStore:
     def __init__(self, root: Path, skip: Set[str]):
         self.root = root
@@ -554,13 +589,16 @@ GraphRAG pipeline summary:
 3) Triple-centric retrieval: embed "s [p] o" and query a triple_vec index to find similar KG triples.
 4) Entity-centric retrieval: embed key entities, match similar KG entities via vector indexes, expand a subgraph to collect triples.
 5) Merge triples, rerank by similarity to the query/triples.
-6) Collect candidate document chunks for those triples (doc_id/chunk_id), then embed and rerank chunks by similarity to the whole query.
+6) Collect candidate document chunks for those triples (doc_id/chunk_id), then score chunks by cosine similarity
+   to the whole query using stored TextChunk.embedding (no per-run chunk embedding).
 7) Answerer answers strictly from selected chunks.
 """.strip()
 
 def _truncate(s: str, max_chars: int) -> str:
-    if not isinstance(s, str): return ""
-    if len(s) <= max_chars: return s
+    if not isinstance(s, str):
+        return ""
+    if len(s) <= max_chars:
+        return s
     return s[: max_chars - 20] + " ...[truncated]"
 
 # --- Agent 1: entities/predicates ---
@@ -571,11 +609,11 @@ QUERY_SCHEMA = {
       "type": "array",
       "items": {
         "type": "object",
-        "properties": { "text": {"type":"string"}, "type": {"type":"string"} },
+        "properties": {"text": {"type":"string"}, "type": {"type":"string"}},
         "required": ["text"]
       }
     },
-    "predicates": { "type": "array", "items": {"type": "string"} }
+    "predicates": {"type": "array", "items": {"type": "string"}}
   },
   "required": ["entities","predicates"]
 }
@@ -611,13 +649,13 @@ QUERY_TRIPLES_SCHEMA = {
                 "properties": {
                     "subject": {
                         "type": "object",
-                        "properties": { "text":{"type":"string"}, "type":{"type":"string"} },
+                        "properties": {"text":{"type":"string"}, "type":{"type":"string"}},
                         "required": ["text"]
                     },
                     "predicate": {"type": "string"},
                     "object": {
                         "type": "object",
-                        "properties": { "text":{"type":"string"}, "type":{"type":"string"} },
+                        "properties": {"text":{"type":"string"}, "type":{"type":"string"}},
                         "required": ["text"]
                     }
                 },
@@ -653,7 +691,7 @@ User question:
         try:
             s = (t.get("subject") or {}).get("text","").strip()
             p = (t.get("predicate") or "").strip()
-            o = (t.get("object")  or {}).get("text","").strip()
+            o = (t.get("object") or {}).get("text","").strip()
             if s and p and o:
                 clean.append({
                     "subject": {"text": s, "type": (t.get("subject") or {}).get("type","").strip()},
@@ -809,7 +847,7 @@ def expand_from_entities(entity_keys: List[str], hops: int, per_hop_limit: int, 
                 }
             if s and s.get("key"): next_keys.add(s.get("key"))
             if o and o.get("key"): next_keys.add(o.get("key"))
-            s_id = r.get("s_id");  o_id = r.get("o_id")
+            s_id = r.get("s_id"); o_id = r.get("o_id")
             if s_id: next_ids.add(s_id)
             if o_id: next_ids.add(o_id)
 
@@ -899,56 +937,102 @@ def entity_centric_retrieval(query_entities: List[Dict[str, Any]], q_trip_embs: 
     log(f"[EntityRetrieval] Selected top-{len(top)} triples from subgraph")
     return top
 
-def collect_chunks_for_triples(triples: List[Dict[str, Any]], chunk_store: ChunkStore) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]]:
+# ----------------- GraphRAG chunk collection + rerank (MODIFIED) -----------------
+def collect_chunks_for_triples_from_neo4j(
+    triples: List[Dict[str, Any]],
+    chunk_store_fallback: Optional[ChunkStore] = None
+) -> List[Tuple[Tuple[Any, Any], str, Optional[List[float]], Dict[str, Any]]]:
+    """
+    Collect chunk candidates for triples, but pull content+embedding from Neo4j (:TextChunk).
+    Falls back to ChunkStore or evidence_quote when needed.
+
+    Returns list of:
+      (key_pair, text, embedding_or_none, triple_dict)
+    """
     seen_pairs: Set[Tuple[Any, Any]] = set()
-    out: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
+    out: List[Tuple[Tuple[Any, Any], str, Optional[List[float]], Dict[str, Any]]] = []
+
     for t in triples:
         doc_id = t.get("document_id")
         chunk_id = t.get("chunk_id")
+
+        # If no chunk pointers, use quote fallback
         if doc_id is None or chunk_id is None:
             quote = t.get("evidence_quote")
             if quote:
                 key = (t.get("triple_uid"), "quote")
                 if key not in seen_pairs:
                     t["_is_quote_fallback"] = True
-                    out.append((key, quote, t))
+                    out.append((key, quote, None, t))
                     seen_pairs.add(key)
             continue
+
         norm_key = (_norm_id(doc_id), _norm_id(chunk_id))
         if norm_key in seen_pairs:
             continue
-        text = chunk_store.get_chunk(doc_id, chunk_id)
-        if text:
+
+        row = fetch_textchunk_by_doc_chunk(doc_id, chunk_id)
+        if row and isinstance(row.get("content"), str) and row.get("content"):
+            emb = row.get("embedding")
+            emb_f = _as_float_list(emb) if emb is not None else None
             t["_is_quote_fallback"] = False
-            out.append((norm_key, text, t))
+            out.append((norm_key, row["content"], emb_f, t))
             seen_pairs.add(norm_key)
-        else:
-            quote = t.get("evidence_quote")
-            if quote:
-                key2 = (t.get("triple_uid"), "quote")
-                if key2 not in seen_pairs:
-                    t["_is_quote_fallback"] = True
-                    log(f"[ChunkStore] FALLBACK to quote for doc={_norm_id(doc_id)} chunk={_norm_id(chunk_id)}", level="WARN")
-                    out.append((key2, quote, t))
-                    seen_pairs.add(key2)
+            log(f"[TextChunk] HIT Neo4j ({row.get('match')}): doc={_norm_id(doc_id)} chunk={_norm_id(chunk_id)} emb={'yes' if emb_f else 'no'}", level="DEBUG")
+            continue
+
+        # Optional fallback to pickle ChunkStore (content only; embedding still missing)
+        if chunk_store_fallback is not None:
+            text = chunk_store_fallback.get_chunk(doc_id, chunk_id)
+            if text:
+                t["_is_quote_fallback"] = False
+                out.append((norm_key, text, None, t))
+                seen_pairs.add(norm_key)
+                log(f"[TextChunk] MISS Neo4j but HIT ChunkStore fallback: doc={_norm_id(doc_id)} chunk={_norm_id(chunk_id)}", level="WARN")
+                continue
+
+        # Final fallback: use quote
+        quote = t.get("evidence_quote")
+        if quote:
+            key2 = (t.get("triple_uid"), "quote")
+            if key2 not in seen_pairs:
+                t["_is_quote_fallback"] = True
+                log(f"[TextChunk] MISS Neo4j: doc={_norm_id(doc_id)} chunk={_norm_id(chunk_id)}; using quote fallback", level="WARN")
+                out.append((key2, quote, None, t))
+                seen_pairs.add(key2)
+
     return out
 
-def rerank_chunks_by_query(chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]], q_emb_query: List[float], top_k: int, cand_limit: Optional[int] = None) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
+def rerank_chunks_by_query_using_stored_embeddings(
+    chunk_records: List[Tuple[Tuple[Any, Any], str, Optional[List[float]], Dict[str, Any]]],
+    q_emb_query: List[float],
+    top_k: int,
+    cand_limit: Optional[int] = None,
+) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
+    """
+    Score chunks by cosine similarity between query embedding and stored chunk embedding.
+    Does NOT embed chunk text at runtime.
+    If a chunk has no embedding, it is kept with score 0.0 (so it can still appear if everything is missing).
+    """
     limit = cand_limit if isinstance(cand_limit, int) and cand_limit > 0 else CHUNK_RERANK_CAND_LIMIT
     cand = chunk_records[:limit]
     t0 = now_ms()
+
     scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
-    for key, text, t in cand:
-        try:
-            emb = embed_text(text)
+    used = 0
+    missing = 0
+    for key, text, emb, t in cand:
+        if isinstance(emb, list) and emb:
             s = cos_sim(q_emb_query, emb)
             scored.append((key, text, t, s))
-        except Exception as ex:
-            log(f"[ChunkRerank] Embedding failed for chunk {key}: {ex}", level="WARN")
-            continue
+            used += 1
+        else:
+            scored.append((key, text, t, 0.0))
+            missing += 1
+
     scored.sort(key=lambda x: x[3], reverse=True)
     took = dur_ms(t0)
-    log(f"[ChunkRerank] Scored {len(scored)} candidates | picked top {min(top_k, len(scored))} | {took:.0f} ms")
+    log(f"[ChunkRerank] Scored {len(scored)} candidates using stored embeddings (used={used}, missing={missing}) | picked top {min(top_k, len(scored))} | {took:.0f} ms")
     return scored[:top_k]
 
 def rerank_triples_by_query_triples(triples: List[Dict[str, Any]], q_trip_embs: List[List[float]], q_emb_fallback: Optional[List[float]], top_k: int) -> List[Dict[str, Any]]:
@@ -965,7 +1049,10 @@ def rerank_triples_by_query_triples(triples: List[Dict[str, Any]], q_trip_embs: 
     log(f"[TripleRerank] Input={len(triples)} | Output={min(top_k, len(ranked))} | {took:.0f} ms")
     return ranked[:top_k]
 
-def build_combined_context_text(triples_ranked: List[Dict[str, Any]], chunks_ranked: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]) -> Tuple[str, str, List[Dict[str, Any]]]:
+def build_combined_context_text(
+    triples_ranked: List[Dict[str, Any]],
+    chunks_ranked: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]
+) -> Tuple[str, str, List[Dict[str, Any]]]:
     summary_lines = []
     summary_lines.append("Ringkasan triple yang relevan:")
     for t in triples_ranked[:min(50, len(triples_ranked))]:
@@ -1123,7 +1210,12 @@ Return JSON:
     return {"modified_query": modified_query, "rationale": rationale}
 
 # ----------------- GraphRAG orchestrator (single-pass retrieval + answer) -----------------
-def run_retrieval_for_query_graph(query_original: str, chunk_store: ChunkStore, user_lang: Optional[str] = None, cand_limit_override: Optional[int] = None) -> Dict[str, Any]:
+def run_retrieval_for_query_graph(
+    query_original: str,
+    chunk_store: Optional[ChunkStore],
+    user_lang: Optional[str] = None,
+    cand_limit_override: Optional[int] = None
+) -> Dict[str, Any]:
     user_lang = user_lang or detect_user_language(query_original)
 
     # Step 0: Embed whole query
@@ -1170,11 +1262,11 @@ def run_retrieval_for_query_graph(query_original: str, chunk_store: ChunkStore, 
     t_merge = dur_ms(t4)
     log(f"[G:Retrieval] Step 4 (merge triples) in {t_merge:.0f} ms; merged={len(merged_triples)}")
 
-    # Step 5: Gather chunks and rerank
+    # Step 5: Gather chunks and rerank (MODIFIED: use stored TextChunk.embedding)
     t5 = now_ms()
-    chunk_records = collect_chunks_for_triples(merged_triples, chunk_store)
-    log(f"[G:Retrieval] Step 5a (collect chunks) candidates={len(chunk_records)}")
-    chunks_ranked = rerank_chunks_by_query(
+    chunk_records = collect_chunks_for_triples_from_neo4j(merged_triples, chunk_store_fallback=chunk_store)
+    log(f"[G:Retrieval] Step 5a (collect chunks from Neo4j) candidates={len(chunk_records)}")
+    chunks_ranked = rerank_chunks_by_query_using_stored_embeddings(
         chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL, cand_limit=cand_limit_override
     )
     t_chunks = dur_ms(t5)
@@ -1222,7 +1314,13 @@ def run_retrieval_for_query_graph(query_original: str, chunk_store: ChunkStore, 
         "diagnostics": diagnostics
     }
 
-def run_single_pass_graph(query_original: str, chunk_store: ChunkStore, user_lang: Optional[str] = None, cand_limit_override: Optional[int] = None, guidance: Optional[str] = None) -> Dict[str, Any]:
+def run_single_pass_graph(
+    query_original: str,
+    chunk_store: Optional[ChunkStore],
+    user_lang: Optional[str] = None,
+    cand_limit_override: Optional[int] = None,
+    guidance: Optional[str] = None
+) -> Dict[str, Any]:
     user_lang = user_lang or detect_user_language(query_original)
     r = run_retrieval_for_query_graph(query_original, chunk_store, user_lang, cand_limit_override)
     context_text = r["context_text"]
@@ -1239,7 +1337,7 @@ def run_single_pass_graph(query_original: str, chunk_store: ChunkStore, user_lan
         "timings_ms": r["diagnostics"]["timings_ms"]
     }
 
-def run_graphrag_loop(query_original: str, chunk_store: ChunkStore, user_lang: str) -> Dict[str, Any]:
+def run_graphrag_loop(query_original: str, chunk_store: Optional[ChunkStore], user_lang: str) -> Dict[str, Any]:
     qaf_history: List[Dict[str, Any]] = []
     per_iteration: List[Dict[str, Any]] = []
     current_query = query_original
@@ -1349,7 +1447,6 @@ def convert_to_db_formats(uu_identifier: str) -> List[str]:
     if m:
         num, year = int(m.group(1)), int(m.group(2))
         return [f"Undang-undang (UU) Nomor {num} Tahun {year}", f"Undang-undang (UU) No. {num} Tahun {year}"]
-    # Try extracting from full strings
     pats = [
         r'(?:UU|Undang-undang|Undang-Undang)\s*(?:\(UU\))?\s*(?:Nomor|No\.?)\s*(\d+)\s*Tahun\s*(\d{4})',
         r'(?:UU|Undang-undang|Undang-Undang)\s*(\d+)/(\d{4})',
@@ -1729,7 +1826,6 @@ Return JSON:
     final_answer = (out.get("final_answer") or "").strip()
     rationale = (out.get("rationale") or "").strip()
     if decision not in ("choose_graphrag","choose_naiverag","merge") or not final_answer:
-        # Fallback heuristic: prefer answer with more legal cues; else GraphRAG
         def score(a: str) -> int:
             t = a.lower()
             cues = 0
@@ -1750,16 +1846,15 @@ Return JSON:
     return {"decision": decision, "final_answer": final_answer, "rationale": rationale}
 
 # ----------------- Amendment-aware utilities (shared) -----------------
-# Amendment graph helpers
 def normalize_uu_identifier(number: int, year: int) -> str:
     return f"AMD_{number}_{year}"
 
 def get_outgoing_amendments(uu_key: str) -> List[Dict[str, Any]]:
     cypher = """
     MATCH (source:AMD_UndangUndang {key: $uu_key})-[r]->(target:AMD_UndangUndang)
-    WHERE type(r) IN ['AMD_DIUBAH_DENGAN', 'AMD_DIUBAH_SEBAGIAN_DENGAN', 
+    WHERE type(r) IN ['AMD_DIUBAH_DENGAN', 'AMD_DIUBAH_SEBAGIAN_DENGAN',
                       'AMD_DICABUT_DENGAN', 'AMD_DICABUT_SEBAGIAN_DENGAN']
-    RETURN target.key AS target_key, 
+    RETURN target.key AS target_key,
            target.number AS target_number,
            target.year AS target_year,
            type(r) AS relationship_type
@@ -1777,7 +1872,6 @@ def get_outgoing_amendments(uu_key: str) -> List[Dict[str, Any]]:
 
 def traverse_amendment_chain_with_reset(start_number: int, start_year: int) -> Dict[str, Any]:
     start_key = normalize_uu_identifier(start_number, start_year)
-    # Check existence
     check_cypher = "MATCH (u:AMD_UndangUndang {key: $key}) RETURN u"
     exists = run_cypher_with_retry(check_cypher, {"key": start_key})
     if not exists:
@@ -1846,7 +1940,6 @@ def generate_currency_warning(chain_results: List[Dict[str, Any]]) -> str:
         warnings.append(f"⚠️ {original} telah {'; '.join(descs)}. Memeriksa ketentuan terbaru...")
     return "\n".join(warnings)
 
-# UU reference extraction (LLM)
 UU_REFERENCE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1893,7 +1986,6 @@ Text:
     log(f"[Amendment] Found {len(refs)} UU references: {[(r.get('number'), r.get('year')) for r in refs]}")
     return refs
 
-# Relevance judge for amendments
 RELEVANCE_JUDGE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1937,9 +2029,14 @@ Return JSON with:
         "reasoning": result.get("reasoning", "") or ""
     }
 
-def integrate_amendments(query_original: str, initial_answer: str, new_context: str,
-                         amendment_info: List[Dict[str, Any]], relevance_result: Dict[str, Any],
-                         output_lang: str = "id") -> str:
+def integrate_amendments(
+    query_original: str,
+    initial_answer: str,
+    new_context: str,
+    amendment_info: List[Dict[str, Any]],
+    relevance_result: Dict[str, Any],
+    output_lang: str = "id"
+) -> str:
     amendment_descriptions = []
     for amd in amendment_info:
         from_uu = format_uu_display(amd["from"])
@@ -1978,7 +2075,6 @@ Respond in {output_lang}.
     log("[Amendment] Integrating amendments into final answer...")
     return safe_generate_text(prompt, max_tokens=ANSWER_MAX_TOKENS, temperature=0.2)
 
-# Cache for amendment chains (shared across pipelines)
 _AMENDMENT_CHAIN_CACHE: Dict[str, Dict[str, Any]] = {}
 _AMENDMENT_CHAIN_LOCK = Lock()
 
@@ -1993,17 +2089,6 @@ def traverse_amendment_chain_with_reset_cached(number: int, year: int) -> Dict[s
     return res
 
 def apply_amendments_pre_aggregation(query_original: str, initial_answer: str, user_lang: str) -> Dict[str, Any]:
-    """
-    Full amendment-aware pass on a pipeline's answer. Returns:
-    {
-        "final_answer": str,
-        "has_amendments": bool,
-        "currency_warnings": str,
-        "amendment_info": List[dict],
-        "amending_chunks_used": int
-    }
-    """
-    # 1) Extract UU references from the answer (LLM)
     refs = extract_uu_references_llm(initial_answer)
     if not refs:
         log("[Amendment] No UU references detected in answer. Skipping amendment handling.")
@@ -2015,7 +2100,6 @@ def apply_amendments_pre_aggregation(query_original: str, initial_answer: str, u
             "amending_chunks_used": 0
         }
 
-    # 2) Traverse amendment chains (cached)
     chain_results = []
     amending_set: Set[str] = set()
     all_amendment_info: List[Dict[str, Any]] = []
@@ -2033,7 +2117,6 @@ def apply_amendments_pre_aggregation(query_original: str, initial_answer: str, u
 
     currency_warning = generate_currency_warning(chain_results) if chain_results else ""
     if not amending_set:
-        # No downstream amendments detected
         log("[Amendment] No amending UUs found. Returning original answer (with warning if any).")
         final = (currency_warning + "\n" if currency_warning else "") + initial_answer
         return {
@@ -2044,7 +2127,7 @@ def apply_amendments_pre_aggregation(query_original: str, initial_answer: str, u
             "amending_chunks_used": 0
         }
 
-    # 3) Retrieve chunks from the amending documents (two-stage filtering)
+    # Query embedding (needed for vector retrieval); chunks are retrieved using stored embeddings
     q_emb = embed_text(query_original)
     amending_chunks = vector_query_chunks_filtered(q_emb, k=TOP_K_CHUNKS, uu_filters=list(amending_set))
 
@@ -2053,7 +2136,7 @@ def apply_amendments_pre_aggregation(query_original: str, initial_answer: str, u
         final = initial_answer
         if currency_warning:
             final = currency_warning + "\n" + final
-        final += f"\nCatatan: UU yang dirujuk mengalami amandemen, namun tidak ditemukan potongan relevan yang mengubah jawaban di atas."
+        final += "\nCatatan: UU yang dirujuk mengalami amandemen, namun tidak ditemukan potongan relevan yang mengubah jawaban di atas."
         return {
             "final_answer": final,
             "has_amendments": True,
@@ -2062,13 +2145,12 @@ def apply_amendments_pre_aggregation(query_original: str, initial_answer: str, u
             "amending_chunks_used": 0
         }
 
-    # 4) Judge whether those amendments are relevant to the question
     rel = judge_amendment_relevance(query_original, initial_answer, amending_chunks)
     if not rel.get("is_relevant"):
         final = initial_answer
         if currency_warning:
             final = currency_warning + "\n" + final
-        final += f"\nCatatan: Amandemen tidak mempengaruhi aspek yang ditanyakan; jawaban tetap berlaku."
+        final += "\nCatatan: Amandemen tidak mempengaruhi aspek yang ditanyakan; jawaban tetap berlaku."
         return {
             "final_answer": final,
             "has_amendments": True,
@@ -2077,7 +2159,6 @@ def apply_amendments_pre_aggregation(query_original: str, initial_answer: str, u
             "amending_chunks_used": 0
         }
 
-    # 5) Integrate amendments
     new_context = build_context_from_chunks(amending_chunks, max_chunks=MAX_CHUNKS_FINAL)
     integrated = integrate_amendments(query_original, initial_answer, new_context, all_amendment_info, rel, output_lang=user_lang)
     final_answer = (currency_warning + "\n" if currency_warning else "") + integrated
@@ -2108,10 +2189,9 @@ def run_multi_agent(query_original: str) -> Dict[str, Any]:
         user_lang = detect_user_language(query_original)
         log(f"[Language] Detected user language: {user_lang}")
 
-        # Build ChunkStore once (shared by GraphRAG)
+        # ChunkStore now optional; kept for fallback only
         chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
 
-        # Results to fill (from parallel threads)
         G_res: Dict[str, Any] = {}
         N_res: Dict[str, Any] = {}
         exc: Dict[str, str] = {}
@@ -2123,7 +2203,6 @@ def run_multi_agent(query_original: str) -> Dict[str, Any]:
                 base_answer = (base_out.get("final_answer") or "").strip()
                 amend = apply_amendments_pre_aggregation(query_original, base_answer, user_lang)
                 G_res.update(base_out)
-                # Replace pipeline answer with amendment-aware answer
                 G_res["final_answer"] = amend["final_answer"]
                 G_res["amendment"] = {
                     "has_amendments": amend["has_amendments"],
@@ -2142,7 +2221,6 @@ def run_multi_agent(query_original: str) -> Dict[str, Any]:
                 base_answer = (base_out.get("final_answer") or "").strip()
                 amend = apply_amendments_pre_aggregation(query_original, base_answer, user_lang)
                 N_res.update(base_out)
-                # Replace pipeline answer with amendment-aware answer
                 N_res["final_answer"] = amend["final_answer"]
                 N_res["amendment"] = {
                     "has_amendments": amend["has_amendments"],
@@ -2154,7 +2232,6 @@ def run_multi_agent(query_original: str) -> Dict[str, Any]:
                 exc["N"] = str(e)
                 log(f"[N] Error: {e}", level="ERROR")
 
-        # Run both pipelines in parallel threads
         t0 = now_ms()
         tG = Thread(target=run_G, name="GraphRAGThread", daemon=True)
         tN = Thread(target=run_N, name="NaiveRAGThread", daemon=True)
@@ -2170,7 +2247,6 @@ def run_multi_agent(query_original: str) -> Dict[str, Any]:
         elif "N" in exc and not n_answer and g_answer:
             final = {"decision": "choose_graphrag", "final_answer": g_answer, "rationale": "NaiveRAG failed. Using GraphRAG answer."}
         else:
-            # Provide small meta to aggregator for audit
             g_meta = {
                 "iterations_used": G_res.get("iterations_used"),
                 "context_hint": "Graph triples + chunks",
@@ -2233,10 +2309,9 @@ def run_multi_agent_after_aggregation(query_original: str) -> Dict[str, Any]:
         user_lang = detect_user_language(query_original)
         log(f"[Language] Detected user language: {user_lang}")
 
-        # Build ChunkStore once (shared by GraphRAG)
+        # ChunkStore now optional; kept for fallback only
         chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
 
-        # Results to fill (from parallel threads)
         G_res: Dict[str, Any] = {}
         N_res: Dict[str, Any] = {}
         exc: Dict[str, str] = {}
@@ -2246,15 +2321,9 @@ def run_multi_agent_after_aggregation(query_original: str) -> Dict[str, Any]:
                 set_log_context("G", None)
                 base_out = run_graphrag_loop(query_original, chunk_store, user_lang)
                 base_answer = (base_out.get("final_answer") or "").strip()
-                # NOTE (Option B): no amendment pass here
                 G_res.update(base_out)
                 G_res["final_answer"] = base_answer
-                G_res["amendment"] = {
-                    "has_amendments": False,
-                    "currency_warnings": "",
-                    "amendment_info": [],
-                    "amending_chunks_used": 0
-                }
+                G_res["amendment"] = {"has_amendments": False, "currency_warnings": "", "amendment_info": [], "amending_chunks_used": 0}
             except Exception as e:
                 exc["G"] = str(e)
                 log(f"[G] Error: {e}", level="ERROR")
@@ -2264,20 +2333,13 @@ def run_multi_agent_after_aggregation(query_original: str) -> Dict[str, Any]:
                 set_log_context("N", None)
                 base_out = run_naiverag_loop(query_original, user_lang)
                 base_answer = (base_out.get("final_answer") or "").strip()
-                # NOTE (Option B): no amendment pass here
                 N_res.update(base_out)
                 N_res["final_answer"] = base_answer
-                N_res["amendment"] = {
-                    "has_amendments": False,
-                    "currency_warnings": "",
-                    "amendment_info": [],
-                    "amending_chunks_used": 0
-                }
+                N_res["amendment"] = {"has_amendments": False, "currency_warnings": "", "amendment_info": [], "amending_chunks_used": 0}
             except Exception as e:
                 exc["N"] = str(e)
                 log(f"[N] Error: {e}", level="ERROR")
 
-        # Run both pipelines in parallel threads
         t0 = now_ms()
         tG = Thread(target=run_G, name="GraphRAGThread", daemon=True)
         tN = Thread(target=run_N, name="NaiveRAGThread", daemon=True)
@@ -2293,7 +2355,6 @@ def run_multi_agent_after_aggregation(query_original: str) -> Dict[str, Any]:
         elif "N" in exc and not n_answer and g_answer:
             final = {"decision": "choose_graphrag", "final_answer": g_answer, "rationale": "NaiveRAG failed. Using GraphRAG answer."}
         else:
-            # Provide small meta to aggregator for audit
             g_meta = {
                 "iterations_used": G_res.get("iterations_used"),
                 "context_hint": "Graph triples + chunks",
@@ -2308,7 +2369,6 @@ def run_multi_agent_after_aggregation(query_original: str) -> Dict[str, Any]:
             }
             final = aggregator_agent(query_original, g_answer, n_answer, g_meta, n_meta, user_lang)
 
-        # NOTE (Option B): single amendment-aware pass AFTER aggregation
         amended = apply_amendments_pre_aggregation(query_original, final.get("final_answer", ""), user_lang)
         final["final_answer"] = amended["final_answer"]
 
