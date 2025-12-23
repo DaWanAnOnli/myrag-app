@@ -76,16 +76,16 @@ LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
 SKIP_FILES = {"all_langchain_documents.pkl"}
 
 # ----------------- GraphRAG parameters -----------------
-ENTITY_MATCH_TOP_K = int(os.getenv("ENTITY_MATCH_TOP_K", "15"))
-ENTITY_SUBGRAPH_HOPS = int(os.getenv("ENTITY_SUBGRAPH_HOPS", "5"))
-ENTITY_SUBGRAPH_PER_HOP_LIMIT = int(os.getenv("ENTITY_SUBGRAPH_PER_HOP_LIMIT", "2000"))
-SUBGRAPH_TRIPLES_TOP_K = int(os.getenv("SUBGRAPH_TRIPLES_TOP_K", "30"))
-QUERY_TRIPLE_MATCH_TOP_K_PER = int(os.getenv("QUERY_TRIPLE_MATCH_TOP_K_PER", "20"))
-MAX_TRIPLES_FINAL = int(os.getenv("MAX_TRIPLES_FINAL", "60"))
+ENTITY_MATCH_TOP_K = int(os.getenv("ENTITY_MATCH_TOP_K", "5"))
+ENTITY_SUBGRAPH_HOPS = int(os.getenv("ENTITY_SUBGRAPH_HOPS", "3"))
+ENTITY_SUBGRAPH_PER_HOP_LIMIT = int(os.getenv("ENTITY_SUBGRAPH_PER_HOP_LIMIT", "1000"))
+SUBGRAPH_TRIPLES_TOP_K = int(os.getenv("SUBGRAPH_TRIPLES_TOP_K", "15"))
+QUERY_TRIPLE_MATCH_TOP_K_PER = int(os.getenv("QUERY_TRIPLE_MATCH_TOP_K_PER", "10"))
+MAX_TRIPLES_FINAL = int(os.getenv("MAX_TRIPLES_FINAL", "40"))
 MAX_CHUNKS_FINAL = int(os.getenv("MAX_CHUNKS_FINAL", "40"))
 CHUNK_RERANK_CAND_LIMIT = int(os.getenv("CHUNK_RERANK_CAND_LIMIT", "10000000"))
 ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
-MAX_ANSWER_JUDGE_ITERS = int(os.getenv("MAX_ANSWER_JUDGE_ITERS", "5"))
+MAX_ANSWER_JUDGE_ITERS = int(os.getenv("MAX_ANSWER_JUDGE_ITERS", "3"))
 AJ_ANSWER_MAX_CHARS = int(os.getenv("AJ_ANSWER_MAX_CHARS", "400000000"))
 
 # ----------------- NaiveRAG parameters -----------------
@@ -1042,6 +1042,7 @@ Guidelines:
 - If unacceptable, diagnose concrete issues in "problems" (e.g., vague, missing statute identifiers, wrong scope/jurisdiction, incomplete, lacks references).
 - Provide an actionable "suggestion" for modifying the next query so the pipeline can retrieve better context and produce a stronger answer.
 - Keep outputs in the same language as the user's query ("{user_lang}").
+- Do not include your own knowledge in the evaluation; focus on the answer's quality relative to the query.
 
 Current query:
 \"\"\"{current_query}\"\"\"
@@ -1457,6 +1458,7 @@ def answer_judge_naive(current_query: str, current_answer: str, qaf_history: Lis
         "- Judge whether the current answer adequately addresses the current query (relevance, completeness, specificity, legal grounding).\n"
         "- If acceptable: set decision='acceptable'. If insufficient: set decision='insufficient' and provide problem + suggested_solution.\n"
         "- Respond in the same language as the user's question."
+        "- Do not include your own knowledge; focus on the answer's quality relative to the query."
     )
     prompt = f"""
 You are the Answer Judge.

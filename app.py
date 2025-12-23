@@ -537,6 +537,11 @@ def run_pipeline_with_tracking(query: str, mode: str, session_id: str) -> Dict[s
                 "has_amendments": False,
                 "message": "No UU references found"
             })
+            # Emit the final answer after amendment processing
+            tracker.emit("amendment_answer_generated", {
+                "pipeline": pipeline_name,
+                "answer": answer
+            })
             return {
                 "final_answer": answer,
                 "has_amendments": False,
@@ -586,6 +591,11 @@ def run_pipeline_with_tracking(query: str, mode: str, session_id: str) -> Dict[s
                 "has_amendments": False,
                 "message": "No amending UUs found"
             })
+            # Emit the final answer after amendment processing
+            tracker.emit("amendment_answer_generated", {
+                "pipeline": pipeline_name,
+                "answer": final
+            })
             return {
                 "final_answer": final,
                 "has_amendments": False,
@@ -615,8 +625,12 @@ def run_pipeline_with_tracking(query: str, mode: str, session_id: str) -> Dict[s
             tracker.emit("amendment_complete", {
                 "pipeline": pipeline_name,
                 "has_amendments": True,
-                "message": "No relevant amending chunks found",
-                "amending_chunks_used": 0
+                "message": "No relevant amending chunks found"
+            })
+            # Emit the final answer after amendment processing
+            tracker.emit("amendment_answer_generated", {
+                "pipeline": pipeline_name,
+                "answer": final
             })
             return {
                 "final_answer": final,
@@ -654,6 +668,11 @@ def run_pipeline_with_tracking(query: str, mode: str, session_id: str) -> Dict[s
                 "message": "Amendments not relevant to query",
                 "relevance_result": rel
             })
+            # Emit the final answer after amendment processing
+            tracker.emit("amendment_answer_generated", {
+                "pipeline": pipeline_name,
+                "answer": final
+            })
             return {
                 "final_answer": final,
                 "has_amendments": True,
@@ -683,8 +702,13 @@ def run_pipeline_with_tracking(query: str, mode: str, session_id: str) -> Dict[s
             "pipeline": pipeline_name,
             "has_amendments": True,
             "message": "Amendments integrated",
-            "amending_chunks_used": len(amending_chunks),
             "relevance_result": rel
+        })
+        
+        # Emit the final answer after amendment processing
+        tracker.emit("amendment_answer_generated", {
+            "pipeline": pipeline_name,
+            "answer": final_answer
         })
         
         return {

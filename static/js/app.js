@@ -190,6 +190,9 @@ class LegalQAApp {
             case 'amendment_complete':
                 this.handleAmendmentComplete(event.data);
                 break;
+            case 'amendment_answer_generated':
+                this.handleAmendmentAnswerGenerated(event.data);
+                break;
             case 'aggregator_decision':
                 this.handleAggregatorDecision(event.data);
                 break;
@@ -364,7 +367,15 @@ class LegalQAApp {
         this.amendmentData[pipeline].complete = true;
         this.amendmentData[pipeline].hasAmendments = has_amendments;
         this.amendmentData[pipeline].message = message;
-        this.amendmentData[pipeline].amendingChunksUsed = amending_chunks_used;
+        this.renderAmendmentTab();
+    }
+    
+    handleAmendmentAnswerGenerated(data) {
+        const { pipeline, answer } = data;
+        if (!this.amendmentData[pipeline]) {
+            this.amendmentData[pipeline] = {};
+        }
+        this.amendmentData[pipeline].finalAnswer = answer;
         this.renderAmendmentTab();
     }
     
@@ -739,9 +750,18 @@ class LegalQAApp {
                         <div class="section-label">📋 Amendment Processing Result</div>
                         <div class="section-content">
                             <strong>Status:</strong> ${data.message || 'Complete'}<br>
-                            <strong>Has Amendments:</strong> ${data.hasAmendments ? 'Yes' : 'No'}<br>
-                            ${data.amendingChunksUsed !== undefined ? `<strong>Amending Chunks Used:</strong> ${data.amendingChunksUsed}` : ''}
+                            <strong>Has Amendments:</strong> ${data.hasAmendments ? 'Yes' : 'No'}
                         </div>
+                    </div>
+                `;
+            }
+            
+            // Final Answer after Amendment Processing
+            if (data.finalAnswer) {
+                html += `
+                    <div class="iteration-section">
+                        <div class="section-label">✨ Answer After Amendment Processing</div>
+                        <div class="section-content amendment-answer">${this.escapeHtml(data.finalAnswer)}</div>
                     </div>
                 `;
             }

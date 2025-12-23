@@ -617,6 +617,16 @@ body {
     border: 1px solid var(--border-color);
 }
 
+/* Amendment Answer styling */
+.section-content.amendment-answer {
+    white-space: pre-wrap;
+    max-height: 400px;
+    overflow-y: auto;
+    background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
+    border-left: 4px solid var(--success-color);
+    font-size: 0.95rem;
+}
+
 /* Aggregator Container */
 .aggregator-container {
     display: flex;
