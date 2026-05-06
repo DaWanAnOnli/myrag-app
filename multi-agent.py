@@ -101,6 +101,14 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 _EMBED_MODEL_INSTANCE = None
 _EMBED_MODEL_LOCK = threading.Lock()
 
+def _has_cuda() -> bool:
+    """Check if CUDA GPU is available."""
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
 def _get_embed_model():
     """Lazily load and cache bge-m3 as a singleton. Uses GPU if available."""
     global _EMBED_MODEL_INSTANCE
@@ -114,9 +122,10 @@ def _get_embed_model():
         except ImportError:
             raise RuntimeError("sentence-transformers not installed. Run: pip install sentence-transformers")
         model_name = EMBED_MODEL_NAME
-        log(f"[EmbedModel] Loading '{model_name}' (device=auto)...")
+        device = "cuda" if _has_cuda() else "cpu"
+        log(f"[EmbedModel] Loading '{model_name}' (device={device})...")
         t0 = now_ms()
-        _EMBED_MODEL_INSTANCE = SentenceTransformer(model_name, device="auto")
+        _EMBED_MODEL_INSTANCE = SentenceTransformer(model_name, device=device)
         log(f"[EmbedModel] Loaded in {dur_ms(t0):.0f} ms on {_EMBED_MODEL_INSTANCE.device}")
         return _EMBED_MODEL_INSTANCE
 
