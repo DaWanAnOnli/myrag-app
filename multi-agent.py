@@ -53,7 +53,9 @@ NEO4J_MAX_CONCURRENCY = int(os.getenv("NEO4J_MAX_CONCURRENCY", "0"))  # 0=unlimi
 
 # Models
 GEN_MODEL   = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
+# EMBED_MODEL is deprecated; Gemini embedding no longer used
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-m3")
+EMBED_DIMENSION = 1024  # BAAI/bge-m3 output dimension
 
 # Dataset folder for original chunk pickles (GraphRAG ChunkStore) — now optional for fallback only
 DEFAULT_LANGCHAIN_DIR = (_here / "../../../dataset/3_indexing/3a_langchain_results/").resolve()
@@ -94,6 +96,29 @@ AGG_TEMPERATURE = float(os.getenv("AGG_TEMPERATURE", "0.2"))
 genai.configure(api_key=GOOGLE_API_KEY)
 gen_model = genai.GenerativeModel(GEN_MODEL)
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+
+# ----------------- Local Embedding Model (BAAI/bge-m3) -----------------
+_EMBED_MODEL_INSTANCE = None
+_EMBED_MODEL_LOCK = threading.Lock()
+
+def _get_embed_model():
+    """Lazily load and cache bge-m3 as a singleton. Uses GPU if available."""
+    global _EMBED_MODEL_INSTANCE
+    if _EMBED_MODEL_INSTANCE is not None:
+        return _EMBED_MODEL_INSTANCE
+    with _EMBED_MODEL_LOCK:
+        if _EMBED_MODEL_INSTANCE is not None:
+            return _EMBED_MODEL_INSTANCE
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise RuntimeError("sentence-transformers not installed. Run: pip install sentence-transformers")
+        model_name = EMBED_MODEL_NAME
+        log(f"[EmbedModel] Loading '{model_name}' (device=auto)...")
+        t0 = now_ms()
+        _EMBED_MODEL_INSTANCE = SentenceTransformer(model_name, device="auto")
+        log(f"[EmbedModel] Loaded in {dur_ms(t0):.0f} ms on {_EMBED_MODEL_INSTANCE.device}")
+        return _EMBED_MODEL_INSTANCE
 
 # ----------------- Logger -----------------
 _LOGGER = None
@@ -226,7 +251,7 @@ class QpsLimiter:
 
 _EMBED_SEM = Semaphore(LLM_EMBED_MAX_CONCURRENCY)
 _GEN_SEM   = Semaphore(LLM_GEN_MAX_CONCURRENCY)
-_EMBED_QPS = QpsLimiter(LLM_EMBED_QPS)
+_EMBED_QPS = None  # removed: local GPU inference has no API rate limits
 _GEN_QPS   = QpsLimiter(LLM_GEN_QPS)
 _NEO4J_SEM = Semaphore(NEO4J_MAX_CONCURRENCY) if NEO4J_MAX_CONCURRENCY > 0 else None
 
@@ -307,30 +332,19 @@ def _api_call_with_retry(func, *args, **kwargs):
             time.sleep(wait_s)
 
 def embed_text(text: str) -> List[float]:
-    """Used only for query / query-triple / entity embeddings (not chunk text reranking)."""
+    """Embed text using the local BAAI/bge-m3 model. Returns a 1024-dim list of floats."""
     key = _cache_key_for_text(text)
     with _EMB_CACHE_LOCK:
         if key in _EMB_CACHE:
             return list(_EMB_CACHE[key])
     with _EMBED_SEM:
-        _EMBED_QPS.acquire()
         t0 = now_ms()
-        res = _api_call_with_retry(genai.embed_content, model=EMBED_MODEL, content=text)
-    vec = None
-    if isinstance(res, dict):
-        emb = res.get("embedding")
-        if isinstance(emb, dict) and "values" in emb:
-            vec = emb["values"]
-        elif isinstance(emb, list):
-            vec = emb
-    if vec is None:
-        try:
-            vec = res.embedding.values  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    if vec is None:
-        raise RuntimeError("Unexpected embedding response shape for embeddings")
+        model = _get_embed_model()
+        embedding = model.encode(text, normalize_embeddings=False)
+        vec = embedding.tolist()
     out = _as_float_list(vec)
+    if len(out) != EMBED_DIMENSION:
+        log(f"[Embed] WARNING: expected {EMBED_DIMENSION}-dim vector, got {len(out)}", level="WARN")
     log(f"[Embed] text_len={len(text)} -> vec_len={len(out)} | {dur_ms(t0):.0f} ms", level="DEBUG")
     with _EMB_CACHE_LOCK:
         if len(_EMB_CACHE) >= CACHE_EMBED_MAX_ITEMS:

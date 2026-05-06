@@ -3,3 +3,5 @@ flask-cors>=4.0.0
 python-dotenv>=1.0.0
 google-generativeai>=0.3.0
 neo4j>=5.0.0
+sentence-transformers>=2.4.0
+torch>=2.0.0
